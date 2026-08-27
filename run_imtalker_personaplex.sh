@@ -39,8 +39,8 @@ required=(
 )
 for path in "${required[@]}"; do [[ -e "$path" ]] || { echo "Missing required file: $path" >&2; exit 1; }; done
 declare -A hashes=(
- ["$IM/imtalker_personaplex_try_vad2_8998.py"]="d05408684373d86e6e2b4bef3cca66e79a55d78ce83434275c37c042f6774a76"
- ["$IM/static/index_v3_binary_fullscreen_robot_try_vad2.html"]="5cf3981351668e0366b7b4adf2f36c7e43f5ab0c672f6616a343a72817582fa6"
+ ["$IM/imtalker_personaplex_try_vad2_8998.py"]="cfbc502f47397b9ce7149612f634c779a6f5d0ce62fa760cb3d4ba11ec45b439"
+ ["$IM/static/index_v3_binary_fullscreen_robot_try_vad2.html"]="a8a45c0b0e53de6f7ef8ae0999c6f4d80cf1e4238383a6789f88f80d8753af49"
  ["$IM/static/assets/robert_idle_10s.mp4"]="6bdfb847fb3dd2a76d42278a138e26e2729bf5ed938f6733a3b428768a9e7916"
  ["$IM/experiments/original_pod_8998/FM.py"]="8620d6cad2b945276a792a1d63159369654cbb83f9114ab5788f93a3d8daf5d9"
  ["$IM/experiments/original_pod_8998/FMT.py"]="286eb512e710926b0a88d1bc47f14aef5cfc3ef6fc0987fc3cf0d9e7bd004c5d"
