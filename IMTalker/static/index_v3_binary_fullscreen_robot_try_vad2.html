@@ -280,19 +280,26 @@
     const AV_START_AUDIO_SECONDS = 0.40;
 
     // Closing-mouth capture: while the avatar speaks normally, keep a short
-    // rolling buffer of the most recently drawn frames (bitmap + raw jpeg).
-    // The window we snapshot is anchored to the *last confirmed-loud* frame
-    // (mouth clearly open) through the *first confirmed-quiet* instant
-    // (mouth settled closed) — i.e. the actual open->closing->closed arc,
-    // not an arbitrary offset from the quiet detection alone. Captured once;
-    // if a candidate window fails the sanity checks, capture is skipped and
-    // retried on the next natural pause instead of locking in a bad clip.
-    let rollingFrames = [];               // [{bitmap, jpegB64, t}] trim window
+    // rolling buffer of the most recently drawn frames (bitmap + raw jpeg),
+    // tagged with the same frameIdx the render loop uses. RMS is measured at
+    // audio *decode* time, which runs well ahead of actual *playback* time
+    // (by however deep the buffer is) — so decode-time wall-clock timestamps
+    // do NOT line up with when that audio is actually on screen. Instead,
+    // every decoded chunk is placed on the reply's own audio-elapsed-seconds
+    // timeline (replyAudioPosSec), the same timeline the render loop already
+    // converts to frame indices via floor(audioElapsed * targetFps) — so RMS
+    // events and frames are compared in one shared coordinate system, not
+    // wall-clock time. The window snapshot spans the last confirmed-loud
+    // audio position (mouth open) through the first confirmed-quiet position
+    // (mouth settled closed). Captured once; a candidate that fails the
+    // sanity checks is skipped and retried on the next natural pause.
+    let rollingFrames = [];               // [{bitmap, jpegB64, frameIdx, t}] trim window
     const ROLLING_FRAME_WINDOW_MS = 4000;
     let closingMouthFrames = null;        // captured once; reused for every interrupt
     let replySpeechLoud = false;
-    let replyQuietStreakStart = null;
-    let lastLoudAudioTime = null;         // performance.now() of most recent loud reply audio
+    let replyQuietStreakStartSec = null;  // reply-audio-elapsed seconds
+    let replyAudioPosSec = 0;             // cumulative decoded reply-audio seconds
+    let lastLoudAudioPosSec = null;       // reply-audio-elapsed seconds of most recent loud chunk
     const REPLY_LOUD_RMS = 0.02;
     const REPLY_QUIET_RMS = 0.006;
     const REPLY_QUIET_CONFIRM_MS = 260;
@@ -338,9 +345,9 @@
       try { ws.send(JSON.stringify({ type: "client_log", event, detail })); } catch {}
     }
 
-    function rememberFrameForClosingCapture(frame) {
+    function rememberFrameForClosingCapture(frame, frameIdx) {
       const now = performance.now();
-      rollingFrames.push({ bitmap: frame.bitmap, jpegB64: frame.jpegB64, t: now });
+      rollingFrames.push({ bitmap: frame.bitmap, jpegB64: frame.jpegB64, frameIdx, t: now });
       const cutoff = now - ROLLING_FRAME_WINDOW_MS;
       while (rollingFrames.length && rollingFrames[0].t < cutoff) rollingFrames.shift();
     }
@@ -352,52 +359,65 @@
       try { ws.send(JSON.stringify({ type: "save_closing_frames", frames })); } catch {}
     }
 
-    // Anchored to the last confirmed-loud frame (mouth clearly open) through
-    // the instant quiet is confirmed (mouth settled closed) — the actual
-    // open->closing->closed arc, not an arbitrary offset from the quiet point
-    // alone. Rejected candidates (too short / too few frames / no loud
-    // anchor) leave closingMouthFrames null so the next natural pause retries.
-    function captureClosingMouthFrames(openAnchorTime, quietConfirmedTime) {
-      if (openAnchorTime === null) return;
-      let windowStart = openAnchorTime - CLOSING_OPEN_ANCHOR_MARGIN_MS;
-      const windowEnd = quietConfirmedTime;
-      if (windowEnd - windowStart > CLOSING_WINDOW_MAX_MS) windowStart = windowEnd - CLOSING_WINDOW_MAX_MS;
-      if (windowEnd - windowStart < CLOSING_WINDOW_MIN_MS) return;
+    // openAnchorSec/quietConfirmedSec are positions on the reply's own
+    // audio-elapsed-seconds timeline (see replyAudioPosSec below), not
+    // wall-clock time. Converting them to frame indices with the exact same
+    // floor(seconds * targetFps) the render loop uses is what keeps this in
+    // sync with what's actually on screen, instead of decode-vs-playback lag.
+    // Rejected candidates (too short / too few frames / no loud anchor) leave
+    // closingMouthFrames null so the next natural pause retries.
+    function captureClosingMouthFrames(openAnchorSec, quietConfirmedSec) {
+      if (openAnchorSec === null) return;
+      const fps = targetFps || 25;
+      let startSec = Math.max(0, openAnchorSec - CLOSING_OPEN_ANCHOR_MARGIN_MS / 1000);
+      const endSec = quietConfirmedSec;
+      if (endSec - startSec > CLOSING_WINDOW_MAX_MS / 1000) startSec = endSec - CLOSING_WINDOW_MAX_MS / 1000;
+      if (endSec - startSec < CLOSING_WINDOW_MIN_MS / 1000) return;
 
-      const captured = rollingFrames.filter(f => f.t >= windowStart && f.t <= windowEnd);
+      const startFrame = Math.floor(startSec * fps);
+      const endFrame = Math.floor(endSec * fps);
+      const captured = rollingFrames
+        .filter(f => f.frameIdx >= startFrame && f.frameIdx <= endFrame)
+        .sort((a, b) => a.frameIdx - b.frameIdx);
       if (captured.length < CLOSING_WINDOW_MIN_FRAMES) return;
 
       closingMouthFrames = captured.map(f => ({ bitmap: f.bitmap, jpegB64: f.jpegB64 }));
-      const spanMs = Math.round(windowEnd - windowStart);
-      const logMsg = `Captured ${closingMouthFrames.length} closing-mouth frames spanning ${spanMs}ms`;
+      const spanMs = Math.round((endSec - startSec) * 1000);
+      const logMsg = `Captured ${closingMouthFrames.length} closing-mouth frames spanning ${spanMs}ms (frames ${startFrame}-${endFrame})`;
       console.log(logMsg);
-      sendClientLog("closing_frames_captured", { count: closingMouthFrames.length, span_ms: spanMs });
+      sendClientLog("closing_frames_captured", { count: closingMouthFrames.length, span_ms: spanMs, start_frame: startFrame, end_frame: endFrame });
       saveClosingFramesToDisk();
     }
 
-    // Fed with every decoded reply-audio chunk (the actual audio about to be
-    // played). Tracks the loud->quiet transition and captures the frames
-    // spanning it the first time a good candidate is found.
+    // Fed with every decoded reply-audio chunk, in decode order. Places each
+    // chunk on the reply's own audio-elapsed-seconds timeline (independent of
+    // wall-clock decode/network timing), tracks the loud->quiet transition on
+    // that timeline, and captures the frames spanning it the first time a
+    // good candidate is found.
     function trackReplyAudioForClosingCapture(f32) {
+      const sampleRate = (audioCtx && audioCtx.sampleRate) || 48000;
+      const chunkStartSec = replyAudioPosSec;
+      const chunkEndSec = chunkStartSec + f32.length / sampleRate;
+      replyAudioPosSec = chunkEndSec;
+
       if (closingMouthFrames !== null) return;
       const rms = pcmRms(f32);
-      const now = performance.now();
       if (rms >= REPLY_LOUD_RMS) {
         replySpeechLoud = true;
-        replyQuietStreakStart = null;
-        lastLoudAudioTime = now;
+        replyQuietStreakStartSec = null;
+        lastLoudAudioPosSec = chunkEndSec;
         return;
       }
       if (rms <= REPLY_QUIET_RMS) {
         if (!replySpeechLoud) return;
-        if (replyQuietStreakStart === null) replyQuietStreakStart = now;
-        if (now - replyQuietStreakStart >= REPLY_QUIET_CONFIRM_MS) {
-          captureClosingMouthFrames(lastLoudAudioTime, now);
+        if (replyQuietStreakStartSec === null) replyQuietStreakStartSec = chunkStartSec;
+        if ((chunkEndSec - replyQuietStreakStartSec) * 1000 >= REPLY_QUIET_CONFIRM_MS) {
+          captureClosingMouthFrames(lastLoudAudioPosSec, chunkEndSec);
           replySpeechLoud = false;
-          replyQuietStreakStart = null;
+          replyQuietStreakStartSec = null;
         }
       } else {
-        replyQuietStreakStart = null;
+        replyQuietStreakStartSec = null;
       }
     }
 
@@ -869,7 +889,7 @@
           const frame = frameStore.get(frameIdx);
           frameStore.delete(frameIdx);
           drawFrameBitmap(frame.bitmap);
-          rememberFrameForClosingCapture(frame);
+          rememberFrameForClosingCapture(frame, frameIdx);
           if (idleUntilFreshFrame && audioStarted) showLiveVideo();
           lastRenderedFrame = frameIdx;
           lastVideoChunkId = frame.chunkId;
@@ -984,7 +1004,7 @@
       lastAudioChunkId=-1; lastVideoChunkId=-1;
       buffering=true; bufferStartTime=performance.now();
       bufferOverlay.classList.remove("visible");
-      replySpeechLoud = false; replyQuietStreakStart = null;
+      replySpeechLoud = false; replyQuietStreakStartSec = null; replyAudioPosSec = 0; lastLoudAudioPosSec = null;
       playClosingClipThenIdle();
       console.log("Playback interruption reset", msg.generation, msg.reason);
     }
@@ -1136,7 +1156,7 @@
       lastRenderedFrame = -1; highestFrameReceived = -1;
       buffering = true; bufferStartTime = 0;
       rollingFrames = []; closingMouthFrames = null;
-      replySpeechLoud = false; replyQuietStreakStart = null; lastLoudAudioTime = null; isPlayingClosingClip = false;
+      replySpeechLoud = false; replyQuietStreakStartSec = null; replyAudioPosSec = 0; lastLoudAudioPosSec = null; isPlayingClosingClip = false;
       lastAudioChunkId = -1; lastVideoChunkId = -1; moshiTranscript = "";
       meterFill.style.width = "0%"; overlayText.textContent = "OFFLINE"; liveDot.classList.remove("active");
       bufferOverlay.classList.remove("visible"); moshiText.innerHTML = '—<span class="cursor"></span>';
