@@ -280,19 +280,26 @@
     const AV_START_AUDIO_SECONDS = 0.40;
 
     // Closing-mouth capture: while the avatar speaks normally, keep a short
-    // rolling buffer of the most recently drawn frames. The first time reply
-    // audio trails off into sustained quiet (a natural end-of-utterance, not
-    // a barge-in), snapshot the frames spanning that fade-out exactly once.
-    // On future interruptions, replay that snapshot instead of a hard cut.
-    let rollingFrames = [];               // [{bitmap, t}] most-recent-first trim window
-    const ROLLING_FRAME_WINDOW_MS = 3000;
+    // rolling buffer of the most recently drawn frames (bitmap + raw jpeg).
+    // The window we snapshot is anchored to the *last confirmed-loud* frame
+    // (mouth clearly open) through the *first confirmed-quiet* instant
+    // (mouth settled closed) — i.e. the actual open->closing->closed arc,
+    // not an arbitrary offset from the quiet detection alone. Captured once;
+    // if a candidate window fails the sanity checks, capture is skipped and
+    // retried on the next natural pause instead of locking in a bad clip.
+    let rollingFrames = [];               // [{bitmap, jpegB64, t}] trim window
+    const ROLLING_FRAME_WINDOW_MS = 4000;
     let closingMouthFrames = null;        // captured once; reused for every interrupt
     let replySpeechLoud = false;
     let replyQuietStreakStart = null;
+    let lastLoudAudioTime = null;         // performance.now() of most recent loud reply audio
     const REPLY_LOUD_RMS = 0.02;
     const REPLY_QUIET_RMS = 0.006;
     const REPLY_QUIET_CONFIRM_MS = 260;
-    const CLOSING_CLIP_PREROLL_MS = 200;
+    const CLOSING_OPEN_ANCHOR_MARGIN_MS = 80;  // include one beat of clearly-open mouth
+    const CLOSING_WINDOW_MAX_MS = 1500;        // guard against capturing an unrelated long pause
+    const CLOSING_WINDOW_MIN_MS = 100;         // shorter than this isn't a real closing arc
+    const CLOSING_WINDOW_MIN_FRAMES = 3;
     let isPlayingClosingClip = false;
 
     const $ = id => document.getElementById(id);
@@ -317,34 +324,60 @@
       return f32.length ? Math.sqrt(sum / f32.length) : 0;
     }
 
-    function rememberFrameForClosingCapture(bitmap) {
+    function bytesToBase64(u8) {
+      let binary = "";
+      const chunkSize = 0x8000;
+      for (let i = 0; i < u8.length; i += chunkSize) {
+        binary += String.fromCharCode.apply(null, u8.subarray(i, i + chunkSize));
+      }
+      return btoa(binary);
+    }
+
+    function sendClientLog(event, detail) {
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      try { ws.send(JSON.stringify({ type: "client_log", event, detail })); } catch {}
+    }
+
+    function rememberFrameForClosingCapture(frame) {
       const now = performance.now();
-      rollingFrames.push({ bitmap, t: now });
+      rollingFrames.push({ bitmap: frame.bitmap, jpegB64: frame.jpegB64, t: now });
       const cutoff = now - ROLLING_FRAME_WINDOW_MS;
       while (rollingFrames.length && rollingFrames[0].t < cutoff) rollingFrames.shift();
     }
 
-    function captureClosingMouthFrames(fadeStartTime) {
-      const preRollFrom = fadeStartTime - CLOSING_CLIP_PREROLL_MS;
-      const captured = rollingFrames.filter(f => f.t >= preRollFrom);
-      if (!captured.length) return;
-      closingMouthFrames = captured.map(f => ({ bitmap: f.bitmap }));
-      const logMsg = `Captured ${closingMouthFrames.length} closing-mouth frames`;
+    function saveClosingFramesToDisk() {
+      if (!closingMouthFrames || !closingMouthFrames.length) return;
+      const frames = closingMouthFrames.map(f => f.jpegB64).filter(Boolean);
+      if (!frames.length || !ws || ws.readyState !== WebSocket.OPEN) return;
+      try { ws.send(JSON.stringify({ type: "save_closing_frames", frames })); } catch {}
+    }
+
+    // Anchored to the last confirmed-loud frame (mouth clearly open) through
+    // the instant quiet is confirmed (mouth settled closed) — the actual
+    // open->closing->closed arc, not an arbitrary offset from the quiet point
+    // alone. Rejected candidates (too short / too few frames / no loud
+    // anchor) leave closingMouthFrames null so the next natural pause retries.
+    function captureClosingMouthFrames(openAnchorTime, quietConfirmedTime) {
+      if (openAnchorTime === null) return;
+      let windowStart = openAnchorTime - CLOSING_OPEN_ANCHOR_MARGIN_MS;
+      const windowEnd = quietConfirmedTime;
+      if (windowEnd - windowStart > CLOSING_WINDOW_MAX_MS) windowStart = windowEnd - CLOSING_WINDOW_MAX_MS;
+      if (windowEnd - windowStart < CLOSING_WINDOW_MIN_MS) return;
+
+      const captured = rollingFrames.filter(f => f.t >= windowStart && f.t <= windowEnd);
+      if (captured.length < CLOSING_WINDOW_MIN_FRAMES) return;
+
+      closingMouthFrames = captured.map(f => ({ bitmap: f.bitmap, jpegB64: f.jpegB64 }));
+      const spanMs = Math.round(windowEnd - windowStart);
+      const logMsg = `Captured ${closingMouthFrames.length} closing-mouth frames spanning ${spanMs}ms`;
       console.log(logMsg);
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        try {
-          ws.send(JSON.stringify({
-            type: "client_log",
-            event: "closing_frames_captured",
-            detail: { count: closingMouthFrames.length, message: logMsg },
-          }));
-        } catch {}
-      }
+      sendClientLog("closing_frames_captured", { count: closingMouthFrames.length, span_ms: spanMs });
+      saveClosingFramesToDisk();
     }
 
     // Fed with every decoded reply-audio chunk (the actual audio about to be
-    // played). Detects the first natural loud->quiet transition and captures
-    // the frames spanning it. No-ops forever once a clip has been captured.
+    // played). Tracks the loud->quiet transition and captures the frames
+    // spanning it the first time a good candidate is found.
     function trackReplyAudioForClosingCapture(f32) {
       if (closingMouthFrames !== null) return;
       const rms = pcmRms(f32);
@@ -352,13 +385,14 @@
       if (rms >= REPLY_LOUD_RMS) {
         replySpeechLoud = true;
         replyQuietStreakStart = null;
+        lastLoudAudioTime = now;
         return;
       }
       if (rms <= REPLY_QUIET_RMS) {
         if (!replySpeechLoud) return;
         if (replyQuietStreakStart === null) replyQuietStreakStart = now;
         if (now - replyQuietStreakStart >= REPLY_QUIET_CONFIRM_MS) {
-          captureClosingMouthFrames(replyQuietStreakStart);
+          captureClosingMouthFrames(lastLoudAudioTime, now);
           replySpeechLoud = false;
           replyQuietStreakStart = null;
         }
@@ -778,7 +812,8 @@
       highestFrameReceived = Math.max(highestFrameReceived, frameIdx);
       if (!frameStore.has(frameIdx)) {
         const bitmap = await decodeFrameFromJpegBytes(jpegU8);
-        frameStore.set(frameIdx, { bitmap, chunkId });
+        const jpegB64 = bytesToBase64(jpegU8);
+        frameStore.set(frameIdx, { bitmap, chunkId, jpegB64 });
         tryReleaseAvStartBarrier();
       }
       sServerFps.textContent = String(targetFps);
@@ -834,7 +869,7 @@
           const frame = frameStore.get(frameIdx);
           frameStore.delete(frameIdx);
           drawFrameBitmap(frame.bitmap);
-          rememberFrameForClosingCapture(frame.bitmap);
+          rememberFrameForClosingCapture(frame);
           if (idleUntilFreshFrame && audioStarted) showLiveVideo();
           lastRenderedFrame = frameIdx;
           lastVideoChunkId = frame.chunkId;
@@ -1012,7 +1047,7 @@
           highestFrameReceived = Math.max(highestFrameReceived, frameIdx);
           if (!frameStore.has(frameIdx)) {
             const bitmap = await decodeFrameBitmap(msg.jpeg_b64);
-            frameStore.set(frameIdx, { bitmap, chunkId: msg.chunk_id });
+            frameStore.set(frameIdx, { bitmap, chunkId: msg.chunk_id, jpegB64: msg.jpeg_b64 });
           }
           sServerFps.textContent = String(msg.server_fps || 0);
           sChunks.textContent = String(msg.chunks_done || 0);
@@ -1029,7 +1064,7 @@
           highestFrameReceived = Math.max(highestFrameReceived, frameIdx);
           if (!frameStore.has(frameIdx)) {
             const bitmap = await decodeFrameBitmap(msg.jpeg_b64);
-            frameStore.set(frameIdx, { bitmap, chunkId: msg.chunk_id });
+            frameStore.set(frameIdx, { bitmap, chunkId: msg.chunk_id, jpegB64: msg.jpeg_b64 });
           }
           sServerFps.textContent = String(msg.server_fps || 0);
           sChunks.textContent = String(msg.chunks_done || 0);
@@ -1101,7 +1136,7 @@
       lastRenderedFrame = -1; highestFrameReceived = -1;
       buffering = true; bufferStartTime = 0;
       rollingFrames = []; closingMouthFrames = null;
-      replySpeechLoud = false; replyQuietStreakStart = null; isPlayingClosingClip = false;
+      replySpeechLoud = false; replyQuietStreakStart = null; lastLoudAudioTime = null; isPlayingClosingClip = false;
       lastAudioChunkId = -1; lastVideoChunkId = -1; moshiTranscript = "";
       meterFill.style.width = "0%"; overlayText.textContent = "OFFLINE"; liveDot.classList.remove("active");
       bufferOverlay.classList.remove("visible"); moshiText.innerHTML = '—<span class="cursor"></span>';

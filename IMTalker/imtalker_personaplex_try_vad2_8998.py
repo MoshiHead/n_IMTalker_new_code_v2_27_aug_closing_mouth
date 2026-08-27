@@ -3195,6 +3195,27 @@ def build_app(args: argparse.Namespace) -> FastAPI:
                         flush=True,
                     )
 
+                elif msg_type == "save_closing_frames":
+                    frames_b64 = payload.get("frames", [])
+                    dump_dir = ROOT / "debug_closing_frames" / session_id[:8]
+                    dump_dir.mkdir(parents=True, exist_ok=True)
+                    saved = 0
+                    for i, frame_b64 in enumerate(frames_b64):
+                        try:
+                            frame_bytes = base64.b64decode(frame_b64)
+                            (dump_dir / f"frame_{i:03d}.jpg").write_bytes(frame_bytes)
+                            saved += 1
+                        except Exception as exc:
+                            print(
+                                f"[CLOSING-FRAMES] session={session_id[:8]} failed to save frame {i}: {exc!r}",
+                                flush=True,
+                            )
+                    print(
+                        f"[CLOSING-FRAMES] session={session_id[:8]} saved={saved}/{len(frames_b64)} "
+                        f"dir={dump_dir}",
+                        flush=True,
+                    )
+
                 elif msg_type == "stop":
                     print("[liveTryHeliumFM] stop requested", flush=True)
                     break
